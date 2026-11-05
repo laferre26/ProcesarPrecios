@@ -13,6 +13,9 @@ En la BD solo se tocan los artículos/listas que vienen en el archivo, todo en u
     No se aplican variaciones mayores a ±60% ni precios de listas/artículos que no existen;
     esos renglones se reportan en el correo.
 
+Si la corrida del timer falla se avisa por correo una sola vez, y otra vez cuando se recupera.
+El aviso va solo a `alertas` de la sección [correo].
+
 Uso:
     procesar.py              # se conecta al SFTP y a la BD vía bridge-api (lo que corre el timer)
     procesar.py --forzar     # vuelve a procesar el más reciente aunque no haya cambiado
@@ -33,6 +36,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 CONFIG = Path.home() / ".config" / "pricelabs-sftp" / "config.ini"
+ALERTA = CONFIG.with_name("alerta_enviada")  # existe mientras haya una falla ya avisada
 
 PATRON = re.compile(r"^Recomendador_La Ferre.*\.csv$")
 
@@ -109,7 +113,7 @@ SELECT f.SKU, f.list, lp.ID, lp.Lista, ld.Precio, CAST(f.precio AS money),
             WHEN a.Articulo IS NULL THEN 'Artículo no existe'
             WHEN a.Estatus <> 'Alta' THEN 'Artículo no activo'
             WHEN ld.Articulo IS NULL THEN 'Nuevo'
-            WHEN ROUND(ld.Precio, 2) = ROUND(f.precio, 2) THEN 'Sin cambio'
+            WHEN ROUND(ld.Precio, 2) = ROUND(CAST(f.precio AS money), 2) THEN 'Sin cambio'
             WHEN ISNULL(ld.Precio, 0) = 0
                  OR ABS(f.precio - ld.Precio) * 100.0 / ld.Precio > {VARIACION_MAXIMA} THEN 'Fuera de rango'
             ELSE 'Actualizado' END
@@ -201,16 +205,16 @@ def armar_correo(archivo, resultado):
     return "".join(partes)
 
 
-def enviar_correo(cfg, asunto, cuerpo_html):
+def enviar_correo(cfg, asunto, cuerpo_html, para=None):
     import smtplib
     from email.message import EmailMessage
 
-    para = [d.strip() for d in cfg["para"].split(",") if d.strip()]
+    para = [d.strip() for d in (para or cfg["para"]).split(",") if d.strip()]
     mensaje = EmailMessage()
     mensaje["Subject"] = asunto
     mensaje["From"] = cfg.get("remitente") or cfg["user"]
     mensaje["To"] = ", ".join(para)
-    mensaje.set_content("Lista de Precios Actualizada. Abre este correo en un cliente que muestre HTML.")
+    mensaje.set_content(f"{asunto}. Abre este correo en un cliente que muestre HTML.")
     mensaje.add_alternative(cuerpo_html, subtype="html")
 
     with smtplib.SMTP(cfg.get("host", "smtp.office365.com"), cfg.getint("port", 587), timeout=60) as smtp:
@@ -314,6 +318,50 @@ def ejecutar_sftp(forzar=False, simular=False):
     log.info("Correo enviado a %s", config["correo"]["para"])
 
 
+def avisar(asunto, cuerpo_html):
+    """Correo de estado del proceso: va solo a `alertas` de [correo], nunca a `para`."""
+    correo = cargar_config()["correo"]
+    enviar_correo(correo, asunto, cuerpo_html, correo["alertas"])
+
+
+def ejecutar_con_alerta():
+    """Corrida del timer: avisa al primer fallo y al recuperarse, no en cada ciclo."""
+    import socket
+
+    equipo = socket.gethostname()
+    try:
+        ejecutar_sftp()
+    except Exception as e:
+        log.exception("Falló el proceso")
+        if not ALERTA.exists():
+            detalle = html.escape(f"{type(e).__name__}: {e}"[:2000])
+            try:
+                avisar(
+                    "ALERTA: falló la actualización de precios de Pricelabs",
+                    "<html><body style='font-family:Arial,sans-serif;color:#333'>"
+                    "<h2>Falló la actualización de precios</h2>"
+                    f"<p>Equipo: <strong>{html.escape(equipo)}</strong></p><pre>{detalle}</pre>"
+                    "<p>El proceso sigue reintentando cada 15 minutos. Revisa si los precios ya se "
+                    "aplicaron antes de reprocesar. Detalle en el servidor:</p>"
+                    "<pre>journalctl -u pricelabs-sftp.service -n 50 --no-pager</pre>"
+                    "</body></html>",
+                )
+                ALERTA.touch()
+            except Exception:
+                # Sin marca: el siguiente ciclo vuelve a intentar la alerta
+                log.exception("No se pudo enviar la alerta")
+        sys.exit(1)
+
+    if ALERTA.exists():
+        avisar(
+            "Resuelto: la actualización de precios de Pricelabs volvió a funcionar",
+            "<html><body style='font-family:Arial,sans-serif;color:#333'>"
+            f"<p>El proceso en <strong>{html.escape(equipo)}</strong> volvió a correr sin errores.</p>"
+            "</body></html>",
+        )
+        ALERTA.unlink()
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
@@ -326,8 +374,10 @@ def main():
 
     if args.local:
         sys.stdout.write(generar_inserts(leer_filas(args.local.read_text(encoding="utf-8-sig"))))
-    else:
+    elif args.forzar or args.simular:
         ejecutar_sftp(args.forzar, args.simular)
+    else:
+        ejecutar_con_alerta()
 
 
 if __name__ == "__main__":

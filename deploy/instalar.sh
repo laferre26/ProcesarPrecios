@@ -9,6 +9,8 @@ USUARIO=pricelabs
 
 [ "$(id -u)" -eq 0 ] || { echo "Correr con sudo" >&2; exit 1; }
 
+# Sin preguntas de needrestart y sin reiniciar servicios del server
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
 apt-get update -qq
 apt-get install -y -qq git python3-venv
 
