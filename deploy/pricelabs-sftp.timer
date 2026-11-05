@@ -1,0 +1,9 @@
+[Unit]
+Description=Revisa el SFTP de Pricelabs cada 15 minutos
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

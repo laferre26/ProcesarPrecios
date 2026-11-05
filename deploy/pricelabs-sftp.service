@@ -1,0 +1,10 @@
+[Unit]
+Description=Procesa el CSV Recomendador La Ferre del SFTP de Pricelabs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pricelabs
+WorkingDirectory=/opt/pricelabs-sftp/app
+ExecStart=/opt/pricelabs-sftp/.venv/bin/python /opt/pricelabs-sftp/app/procesar.py
