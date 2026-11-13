@@ -7,9 +7,13 @@ se compara el contenido contra lo que hay en Procesado y no solo el nombre.
 
 En la BD solo se tocan los artículos/listas que vienen en el archivo, todo en una transacción:
   - LFActualiza: se borra el renglón anterior y se inserta el nuevo (respaldo).
-  - ListaPreciosD: desde LFActualiza se actualiza Precio (PrecioMinimo no se toca) y se
-    registra el cambio en ArtPrecioHist. Si el artículo no estaba en la lista se da de alta
-    con PrecioMinimo = 96% del precio, igual que xpActualizarPrecioLista.
+  - Se crea un movimiento "Precios" de Intelisis (PC/PCD) con todas las listas, a nombre de
+    PLABS000, y se afecta con spAfectar: Intelisis aplica Precio en ListaPreciosD (PrecioMinimo
+    no se toca) y el movimiento queda CONCLUIDO con folio, como registro igual a los manuales.
+    Si Intelisis no lo concluye se deshace todo.
+  - Si el artículo no estaba en la lista se da de alta con PrecioMinimo = 96% del precio,
+    igual que xpActualizarPrecioLista, y también va en el movimiento.
+  - El cambio se registra además en ArtPrecioHist (el movimiento no escribe ahí).
     No se aplican variaciones mayores a ±60% ni precios de listas/artículos que no existen;
     esos renglones se reportan en el correo.
 
@@ -41,6 +45,9 @@ ALERTA = CONFIG.with_name("alerta_enviada")  # existe mientras haya una falla ya
 PATRON = re.compile(r"^Recomendador_La Ferre.*\.csv$")
 
 VARIACION_MAXIMA = 60  # %, mismo límite que xpActualizarPrecioLista
+
+EMPRESA = "FERRE"
+USUARIO_INTELISIS = "PLABS000"  # usuario con el que queda el movimiento "Precios"
 
 log = logging.getLogger("pricelabs")
 
@@ -85,11 +92,12 @@ def generar_inserts(filas):
     return "\n".join(lineas) + "\n"
 
 
-def armar_lote(filas, guardar=True):
-    """Un solo lote T-SQL: carga LFActualiza y desde ahí aplica en ListaPreciosD.
+def armar_lote(filas, archivo, guardar=True):
+    """Un solo lote T-SQL: carga LFActualiza y desde ahí aplica con un movimiento "Precios".
 
-    Devuelve un renglón por artículo/lista con el precio anterior, el nuevo y el estado.
-    Con guardar=False hace todo y al final un ROLLBACK, para simular.
+    Devuelve un renglón por artículo/lista con el precio anterior, el nuevo, el estado y el
+    folio del movimiento (None si no hubo nada que aplicar).
+    Con guardar=False hace todo, incluso afectar el movimiento, y al final un ROLLBACK.
     """
     valores = [f"({sql_texto(codigo)},{precio},{sql_texto(lista)})" for codigo, precio, lista in filas]
     # SQL Server acepta máximo 1000 renglones por VALUES
@@ -124,35 +132,59 @@ LEFT JOIN LaFerre.dbo.Art a ON a.Articulo = f.SKU
 LEFT JOIN LaFerre.dbo.ListaPreciosD ld ON ld.Lista = lp.Lista AND ld.Moneda = 'Pesos' AND ld.Articulo = f.SKU;
 
 DECLARE @fecha datetime = GETDATE();
-UPDATE ld SET Precio = r.nuevo
-FROM LaFerre.dbo.ListaPreciosD ld
-JOIN @res r ON ld.Lista = r.Lista AND ld.Moneda = 'Pesos' AND ld.Articulo = r.SKU
-WHERE r.estado = 'Actualizado';
+-- Las altas se hacen aquí; el movimiento de Intelisis las registra y aplica el mismo precio
 INSERT INTO LaFerre.dbo.ListaPreciosD (Lista, Moneda, Articulo, Precio, PrecioMinimo)
 SELECT Lista, 'Pesos', SKU, nuevo, nuevo * 0.96 FROM @res WHERE estado = 'Nuevo';
+
+-- Movimiento "Precios" en PC/PCD con todas las listas; al afectarlo Intelisis aplica los precios
+-- en ListaPreciosD (PrecioMinimo no lo toca) y queda CONCLUIDO con su folio, como los manuales
+DECLARE @ID int, @Ok int, @OkRef varchar(255), @MovID varchar(20), @msg nvarchar(2048);
+IF EXISTS (SELECT 1 FROM @res WHERE estado IN ('Actualizado', 'Nuevo'))
+BEGIN
+    INSERT INTO LaFerre.dbo.PC (Empresa, Mov, FechaEmision, Moneda, TipoCambio, Estatus, Observaciones, Referencia,
+                                ListaModificar, Usuario, UltimoCambio, Sucursal, SucursalOrigen, Parcial)
+    VALUES ('{EMPRESA}', 'Precios', CONVERT(date, @fecha), 'Pesos', 1, 'SINAFECTAR', LEFT({sql_texto("Pricelabs: " + archivo)}, 100),
+            'Pricelabs', '(Precio Lista)', '{USUARIO_INTELISIS}', @fecha, 0, 0, 1);
+    SET @ID = SCOPE_IDENTITY();
+    INSERT INTO LaFerre.dbo.PCD (ID, Renglon, Articulo, Nuevo, Anterior, Sucursal, SucursalOrigen, ListaModificar)
+    SELECT @ID, 2048.0 * ROW_NUMBER() OVER (ORDER BY Lista, SKU), SKU, nuevo, anterior, 0, 0, Lista
+    FROM @res WHERE estado IN ('Actualizado', 'Nuevo');
+
+    EXEC LaFerre.dbo.spAfectar 'PC', @ID, 'AFECTAR', 'Todo', NULL, '{USUARIO_INTELISIS}',
+         @EnSilencio = 1, @Ok = @Ok OUTPUT, @OkRef = @OkRef OUTPUT;
+    SELECT @MovID = MovID FROM LaFerre.dbo.PC WHERE ID = @ID AND Estatus = 'CONCLUIDO';
+    IF @Ok IS NOT NULL OR @MovID IS NULL
+    BEGIN
+        SET @msg = CONCAT('Intelisis no concluyó el movimiento Precios. Ok=', @Ok, ' ',
+                          (SELECT TOP 1 Descripcion FROM LaFerre.dbo.MensajeLista WHERE Mensaje = @Ok), ' ', @OkRef);
+        THROW 50001, @msg, 1;  -- con XACT_ABORT se deshace todo el lote
+    END
+END
+
 INSERT INTO LaFerre.dbo.ArtPrecioHist (Articulo, Numero, Fecha, PrecioAnterior, PrecioActual)
 SELECT SKU, ListaId, @fecha, ISNULL(anterior, 0), nuevo FROM @res WHERE estado IN ('Actualizado', 'Nuevo')
 UNION ALL
 SELECT SKU, 9000 + ListaId, @fecha, 0, nuevo * 0.96 FROM @res WHERE estado = 'Nuevo';
 {"COMMIT" if guardar else "ROLLBACK"};
 
-SELECT SKU, list, anterior, nuevo, estado FROM @res ORDER BY estado, SKU, list;
+SELECT SKU, list, anterior, nuevo, estado, @MovID movid FROM @res ORDER BY estado, SKU, list;
 """
 
 
-def aplicar_en_bd(cfg, filas, guardar=True):
+def aplicar_en_bd(cfg, filas, archivo, guardar=True):
     """Manda el lote al bridge-api de la intranet, que lo ejecuta desde la red de la BD."""
     import json
     import urllib.request
 
     peticion = urllib.request.Request(
         cfg["url"].rstrip("/") + "/execute",
-        data=json.dumps({"query": armar_lote(filas, guardar)}).encode("utf-8"),
+        data=json.dumps({"query": armar_lote(filas, archivo, guardar)}).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-bridge-token": cfg["token"]},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(peticion, timeout=120) as r:
+        # Afectar el movimiento en Intelisis puede tardar con archivos grandes
+        with urllib.request.urlopen(peticion, timeout=600) as r:
             respuesta = json.load(r)
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"bridge-api respondió {e.code}: {e.read().decode(errors='replace')}")
@@ -160,6 +192,11 @@ def aplicar_en_bd(cfg, filas, guardar=True):
     if len(resultado) != len(filas):
         raise RuntimeError(f"Se esperaban {len(filas)} renglones y el bridge devolvió {len(resultado)}")
     return resultado
+
+
+def folio(resultado):
+    """MovID del movimiento "Precios" generado, o None si no hubo cambios que aplicar."""
+    return next((r["movid"] for r in resultado if r.get("movid")), None)
 
 
 def resumen(resultado):
@@ -189,6 +226,8 @@ def armar_correo(archivo, resultado):
         "<html><body style='font-family:Arial,sans-serif;color:#333'>",
         "<h2>Lista de Precios Actualizada</h2>",
         f"<p>Se aplicó el archivo <strong>{html.escape(archivo)}</strong> de Pricelabs.</p>",
+        (f"<p>Movimiento en Intelisis: <strong>Precios {html.escape(folio(resultado))}</strong> "
+         f"({USUARIO_INTELISIS}).</p>" if folio(resultado) else ""),
         "<ul>",
         f"<li>Precios actualizados: <strong>{conteo['Actualizado']}</strong></li>",
         f"<li>Altas en lista: <strong>{conteo['Nuevo']}</strong></li>",
@@ -292,8 +331,9 @@ def ejecutar_sftp(forzar=False, simular=False):
             return
 
         if simular:
-            resultado = aplicar_en_bd(config["bridge"], filas, guardar=False)
-            log.info("SIMULACIÓN de %s (no se guardó nada): %s", reciente, resumen(resultado))
+            resultado = aplicar_en_bd(config["bridge"], filas, reciente, guardar=False)
+            log.info("SIMULACIÓN de %s (no se guardó nada): %s; movimiento: %s",
+                     reciente, resumen(resultado), folio(resultado) or "ninguno")
             for r in resultado:
                 if r["estado"] != "Sin cambio":
                     print(f"{r['estado']:<20} {r['SKU']:<20} {r['list']:<22} {r['anterior']} -> {r['nuevo']}")
@@ -302,8 +342,9 @@ def ejecutar_sftp(forzar=False, simular=False):
         # Primero la BD: si falla no se sube el archivo y el siguiente ciclo lo reintenta.
         # Reaplicar es seguro porque LFActualiza se reemplaza por artículo/lista y en
         # ListaPreciosD los precios que ya quedaron iguales salen como "Sin cambio".
-        resultado = aplicar_en_bd(config["bridge"], filas)
-        log.info("BD actualizada con %s: %s", reciente, resumen(resultado))
+        resultado = aplicar_en_bd(config["bridge"], filas, reciente)
+        log.info("BD actualizada con %s: %s; movimiento: %s",
+                 reciente, resumen(resultado), folio(resultado) or "ninguno")
 
         # Se sube con nombre temporal y luego se renombra, para que nadie lea un archivo a medias
         temporal = salida + ".tmp"
