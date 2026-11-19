@@ -16,6 +16,8 @@ En la BD solo se tocan los artículos/listas que vienen en el archivo, todo en u
   - El cambio se registra además en ArtPrecioHist (el movimiento no escribe ahí).
     No se aplican variaciones mayores a ±60% ni precios de listas/artículos que no existen;
     esos renglones se reportan en el correo.
+  - Los de variación mayor a ±60% quedan además en un movimiento "Precios" SIN AFECTAR de
+    PLABS000, para que el equipo de Precios los revise y los afecte desde Intelisis.
 
 Si la corrida del timer falla se avisa por correo una sola vez, y otra vez cuando se recupera.
 El aviso va solo a `alertas` de la sección [correo].
@@ -161,13 +163,29 @@ BEGIN
     END
 END
 
+-- Los que no se aplicaron por variación quedan en otro movimiento "Precios" SIN AFECTAR,
+-- para que el equipo de Precios los revise y los afecte desde Intelisis si están bien
+DECLARE @IDPendiente int;
+IF EXISTS (SELECT 1 FROM @res WHERE estado = 'Fuera de rango')
+BEGIN
+    INSERT INTO LaFerre.dbo.PC (Empresa, Mov, FechaEmision, Moneda, TipoCambio, Estatus, Observaciones, Referencia,
+                                ListaModificar, Usuario, UltimoCambio, Sucursal, SucursalOrigen, Parcial)
+    VALUES ('{EMPRESA}', 'Precios', CONVERT(date, @fecha), 'Pesos', 1, 'SINAFECTAR',
+            LEFT({sql_texto("Pricelabs por revisar: " + archivo)}, 100),
+            'Pricelabs por revisar', '(Precio Lista)', '{USUARIO_INTELISIS}', @fecha, 0, 0, 1);
+    SET @IDPendiente = SCOPE_IDENTITY();
+    INSERT INTO LaFerre.dbo.PCD (ID, Renglon, Articulo, Nuevo, Anterior, Sucursal, SucursalOrigen, ListaModificar)
+    SELECT @IDPendiente, 2048.0 * ROW_NUMBER() OVER (ORDER BY Lista, SKU), SKU, nuevo, anterior, 0, 0, Lista
+    FROM @res WHERE estado = 'Fuera de rango';
+END
+
 INSERT INTO LaFerre.dbo.ArtPrecioHist (Articulo, Numero, Fecha, PrecioAnterior, PrecioActual)
 SELECT SKU, ListaId, @fecha, ISNULL(anterior, 0), nuevo FROM @res WHERE estado IN ('Actualizado', 'Nuevo')
 UNION ALL
 SELECT SKU, 9000 + ListaId, @fecha, 0, nuevo * 0.96 FROM @res WHERE estado = 'Nuevo';
 {"COMMIT" if guardar else "ROLLBACK"};
 
-SELECT SKU, list, anterior, nuevo, estado, @MovID movid FROM @res ORDER BY estado, SKU, list;
+SELECT SKU, list, anterior, nuevo, estado, @MovID movid, @IDPendiente pendiente FROM @res ORDER BY estado, SKU, list;
 """
 
 
@@ -197,6 +215,11 @@ def aplicar_en_bd(cfg, filas, archivo, guardar=True):
 def folio(resultado):
     """MovID del movimiento "Precios" generado, o None si no hubo cambios que aplicar."""
     return next((r["movid"] for r in resultado if r.get("movid")), None)
+
+
+def pendiente(resultado):
+    """ID (PC.ID) del movimiento "Precios" sin afectar con los fuera de rango, o None."""
+    return next((r["pendiente"] for r in resultado if r.get("pendiente")), None)
 
 
 def resumen(resultado):
@@ -236,8 +259,14 @@ def armar_correo(archivo, resultado):
         "</ul>",
     ]
     if revisar:
-        partes += [f"<h3>No aplicados</h3><p>Variación mayor a ±{VARIACION_MAXIMA}% o lista/artículo inexistente.</p>",
-                   tabla(revisar)]
+        partes += [f"<h3>No aplicados</h3><p>Variación mayor a ±{VARIACION_MAXIMA}% o lista/artículo inexistente.</p>"]
+        if pendiente(resultado):
+            partes.append(
+                f"<p>Los <strong>{conteo['Fuera de rango']}</strong> fuera de rango quedaron en un movimiento "
+                f"<strong>Precios sin afectar</strong> (ID {pendiente(resultado)}, usuario {USUARIO_INTELISIS}) "
+                "para que Precios los revise en Intelisis y lo afecte si están correctos. "
+                "Los de lista o artículo inexistente no se pueden afectar.</p>")
+        partes.append(tabla(revisar))
     if aplicados:
         partes += ["<h3>Precios aplicados</h3>", tabla(aplicados)]
     partes.append("</body></html>")
@@ -332,8 +361,9 @@ def ejecutar_sftp(forzar=False, simular=False):
 
         if simular:
             resultado = aplicar_en_bd(config["bridge"], filas, reciente, guardar=False)
-            log.info("SIMULACIÓN de %s (no se guardó nada): %s; movimiento: %s",
-                     reciente, resumen(resultado), folio(resultado) or "ninguno")
+            log.info("SIMULACIÓN de %s (no se guardó nada): %s; movimiento: %s; por revisar: %s",
+                     reciente, resumen(resultado), folio(resultado) or "ninguno",
+                     pendiente(resultado) or "ninguno")
             for r in resultado:
                 if r["estado"] != "Sin cambio":
                     print(f"{r['estado']:<20} {r['SKU']:<20} {r['list']:<22} {r['anterior']} -> {r['nuevo']}")
@@ -343,8 +373,9 @@ def ejecutar_sftp(forzar=False, simular=False):
         # Reaplicar es seguro porque LFActualiza se reemplaza por artículo/lista y en
         # ListaPreciosD los precios que ya quedaron iguales salen como "Sin cambio".
         resultado = aplicar_en_bd(config["bridge"], filas, reciente)
-        log.info("BD actualizada con %s: %s; movimiento: %s",
-                 reciente, resumen(resultado), folio(resultado) or "ninguno")
+        log.info("BD actualizada con %s: %s; movimiento: %s; por revisar: %s",
+                 reciente, resumen(resultado), folio(resultado) or "ninguno",
+                 pendiente(resultado) or "ninguno")
 
         # Se sube con nombre temporal y luego se renombra, para que nadie lea un archivo a medias
         temporal = salida + ".tmp"
